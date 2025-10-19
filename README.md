@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/ichbinder-mcp2zigbee2mqtt-badge.png)](https://mseep.ai/app/ichbinder-mcp2zigbee2mqtt)
+
 # ZigBee2MQTT MCP Server
 
 A Model Context Protocol (MCP) server for ZigBee2MQTT that provides intelligent device discovery and control for AI assistants.
