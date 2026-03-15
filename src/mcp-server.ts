@@ -8,6 +8,8 @@ import {
 import { ZigbeeDatabase } from './database.js';
 import { MqttListener } from './mqtt-listener.js';
 import { DeviceInfo, DeviceFieldInfo, IntegrationInfo } from './types.js';
+import { LOGICAL_DEVICES } from './logical-devices.js';
+
 
 export class ZigbeeMcpServer {
   private server: Server;
@@ -37,6 +39,80 @@ export class ZigbeeMcpServer {
 
   getServer(): Server {
     return this.server;
+  }
+
+// ✅ 给 Streamable HTTP (/mcp) 用的：列出工具
+  public getToolDefinitions() {
+    // 直接复用你原来给 tools/list 用的定义
+    return this.getTools();
+  }
+
+  // ✅ 给 Streamable HTTP (/mcp) 用的：按名字调用工具
+  public async callToolByName(name: string, args: any) {
+    try {
+      switch (name) {
+        case 'list_logical_devices':
+          return await this.handleListLogicalDevices();
+        case 'list_devices':
+          return await this.handleListDevices(args);
+        case 'get_device_info':
+          return await this.handleGetDeviceInfo(args);
+        case 'find_devices':
+          return await this.handleFindDevices(args);
+        case 'get_device_state':
+          return await this.handleGetDeviceState(args);
+        case 'send_command':
+          return await this.handleSendCommand(args);
+        case 'find_by_capability':
+          return await this.handleFindByCapability(args);
+        case 'get_integration_info':
+          return await this.handleGetIntegrationInfo(args);
+        case 'get_stats':
+          return await this.handleGetStats();
+        case 'get_device_documentation':
+          return await this.handleGetDeviceDocumentation(args);
+        case 'get_recent_devices':
+          return await this.handleGetRecentDevices(args);
+        default:
+          throw new Error(`Unknown tool: ${name}`);
+      }
+    } catch (error) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text' as const,
+            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+
+
+  private async handleListLogicalDevices() {
+    const list = Object.entries(LOGICAL_DEVICES).map(([name, m]) => {
+        if (m.kind === 'switch') {
+            return {
+                name,
+                kind: m.kind,
+                physicalDevice: m.physicalDevice,
+                stateKey: m.stateKey,
+            };
+        }
+
+        // cover
+        return {
+            name,
+            kind: m.kind,
+            physicalDevice: m.physicalDevice,
+            invert: m.invert ?? false,
+        };
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(list, null, 2) }],
+    };
   }
 
   private setupHandlers(): void {
@@ -89,6 +165,11 @@ export class ZigbeeMcpServer {
 
   private getTools(): Tool[] {
     return [
+      {
+        name: 'list_logical_devices',
+        description: 'List logical devices (like 客厅灯/餐厅灯) and how they map to physical switches/endpoints.',
+        inputSchema: { type: 'object', properties: {} },
+      },
       {
         name: 'list_devices',
         description: 'List all ZigBee devices with basic information',
@@ -336,22 +417,78 @@ export class ZigbeeMcpServer {
 
   private async handleSendCommand(args: any) {
     const { device, command } = args;
-    const dbDevice = this.db.getDevice(device);
 
-    if (!dbDevice) {
-      throw new Error(`Device not found: ${device}`);
+    // 1) 先尝试按“真实设备名/IEEE”找
+    let dbDevice = this.db.getDevice(device);
+    if (dbDevice) {
+      await this.mqtt.publishCommand(dbDevice.friendly_name, command);
+      return {
+        content: [{ type: 'text' as const, text: `Command sent to ${dbDevice.friendly_name}: ${JSON.stringify(command)}` }],
+      };
     }
 
-    await this.mqtt.publishCommand(dbDevice.friendly_name, command);
+    // 2) 找不到就按“逻辑设备名”映射
+    const mapping = LOGICAL_DEVICES[device];
+    if (!mapping) {
+      throw new Error(`Device not found (neither physical nor logical): ${device}`);
+    }
 
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `Command sent to ${dbDevice.friendly_name}: ${JSON.stringify(command)}`,
-        },
-      ],
-    };
+    dbDevice = this.db.getDevice(mapping.physicalDevice);
+    if (!dbDevice) {
+      throw new Error(`Physical device not found for logical device "${device}": ${mapping.physicalDevice}`);
+    }
+
+    // 3) switch：把 state 翻译到 state_left/state_right
+    if (mapping.kind === 'switch') {
+      const state = (command?.state ?? command?.State ?? '').toString().toUpperCase();
+      if (!state) throw new Error(`Missing command.state for switch. Example: {"state":"ON"}`);
+      const translated = { [mapping.stateKey]: state };
+      await this.mqtt.publishCommand(dbDevice.friendly_name, translated);
+      return {
+        content: [{ type: 'text' as const, text: `Logical "${device}" -> ${dbDevice.friendly_name} payload ${JSON.stringify(translated)}` }],
+      };
+    }
+
+    // 4) cover：支持 state OPEN/CLOSE/STOP 或 position 0..100
+    if (mapping.kind === 'cover') {
+      // 4.1 百分比优先
+      if (command?.position !== undefined && command?.position !== null) {
+        let pos = Number(command.position);
+        if (Number.isNaN(pos)) throw new Error(`position must be a number 0..100`);
+        if (pos < 0) pos = 0;
+        if (pos > 100) pos = 100;
+
+        // invert 支持：如果设备定义 open/close 方向反了，翻转百分比
+        if (mapping.invert) pos = 100 - pos;
+
+        // Zigbee2MQTT：position 0..100 发布到 <base>/<friendly>/set [1](https://www.zigbee2mqtt.io/devices/ZM-AM02_cover.html)[2](https://www.zigbee2mqtt.io/guide/usage/mqtt_topics_and_messages.html)
+        const translated = { position: pos };
+        await this.mqtt.publishCommand(dbDevice.friendly_name, translated);
+
+        return {
+          content: [{ type: 'text' as const, text: `Logical "${device}" -> ${dbDevice.friendly_name} payload ${JSON.stringify(translated)}` }],
+        };
+      }
+
+      // 4.2 开/关/停：state OPEN/CLOSE/STOP [1](https://www.zigbee2mqtt.io/devices/ZM-AM02_cover.html)
+      const state = (command?.state ?? '').toString().toUpperCase();
+      if (!state) {
+        throw new Error(`Cover requires command.state (OPEN/CLOSE/STOP) or command.position (0..100).`);
+      }
+      const allowed = new Set(['OPEN', 'CLOSE', 'STOP']);
+      if (!allowed.has(state)) {
+        throw new Error(`Invalid cover state: ${state}. Use OPEN/CLOSE/STOP.`);
+      }
+
+      const translated = { state };
+      await this.mqtt.publishCommand(dbDevice.friendly_name, translated);
+
+      return {
+        content: [{ type: 'text' as const, text: `Logical "${device}" -> ${dbDevice.friendly_name} payload ${JSON.stringify(translated)}` }],
+      };
+    }
+
+    throw new Error(`Unsupported logical device mapping kind`);
   }
 
   private async handleFindByCapability(args: any) {

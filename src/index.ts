@@ -1,13 +1,15 @@
 import { ZigbeeDatabase } from './database.js';
 import { MqttListener, MqttConfig } from './mqtt-listener.js';
 import { ZigbeeMcpServer } from './mcp-server.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import express from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { logger } from './logger.js';
 
-// Load environment variables
+/* ================================
+ * Config（只保留最基础）
+ * ================================ */
+
 const config: MqttConfig = {
   brokerUrl: process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883',
   username: process.env.MQTT_USERNAME || undefined,
@@ -16,137 +18,162 @@ const config: MqttConfig = {
 };
 
 const dbPath = process.env.DB_PATH || './zigbee2mqtt.db';
-const transportMode = process.env.TRANSPORT_MODE || 'stdio'; // 'stdio' or 'http'
-const httpPort = parseInt(process.env.HTTP_PORT || '3235');
+const httpPort = Number(process.env.HTTP_PORT || 3235);
+const httpHost = process.env.HTTP_HOST || '0.0.0.0';
 const apiKey = process.env.API_KEY || undefined;
+const mcpProtocolVersion = process.env.MCP_PROTOCOL_VERSION || '2025-06-18';
 
-async function startStdioMode(db: ZigbeeDatabase, mqtt: MqttListener) {
-  logger.debug('Starting in STDIO mode...');
-  const mcpServer = new ZigbeeMcpServer(db, mqtt, config.baseTopic);
-  const transport = new StdioServerTransport();
-  await mcpServer.connect(transport);
-  logger.info('MCP Server ready');
+/* ================================
+ * Helpers
+ * ================================ */
+
+function authOk(req: Request): boolean {
+  if (!apiKey) return true;
+  const provided = (req.headers['authorization'] as string | undefined)?.replace('Bearer ', '');
+  return provided === apiKey;
 }
 
-async function startHttpMode(db: ZigbeeDatabase, mqtt: MqttListener) {
-  logger.debug(`Starting in HTTP/SSE mode on port ${httpPort}...`);
+type JsonRpcId = string | number | null;
+type JsonRpcRequest = {
+  jsonrpc: '2.0';
+  id?: JsonRpcId;
+  method: string;
+  params?: any;
+};
+
+function jsonRpcResult(id: JsonRpcId, result: any) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function jsonRpcError(id: JsonRpcId, code: number, message: string) {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+/* ================================
+ * HTTP MCP Server（始终启动）
+ * ================================ */
+
+async function startHttpServer(db: ZigbeeDatabase, mqtt: MqttListener) {
+  logger.info(`Starting HTTP MCP server on ${httpHost}:${httpPort}`);
 
   const app = express();
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
 
   const mcpServer = new ZigbeeMcpServer(db, mqtt, config.baseTopic);
 
-  // Health check endpoint
-  app.get('/health', (req, res) => {
-    const stats = db.getStats();
+  // health
+  app.get('/health', (_req, res) => {
     res.json({
       status: 'ok',
       mqtt_connected: mqtt.isConnected(),
-      ...stats,
+      ...db.getStats(),
     });
   });
 
-  // MCP SSE endpoint
+  // legacy SSE
   app.get('/sse', async (req, res) => {
-    // Optional API key authentication
-    if (apiKey) {
-      const providedKey = req.headers['authorization']?.replace('Bearer ', '');
-      if (providedKey !== apiKey) {
-        res.status(401).json({ error: 'Unauthorized' });
-        return;
-      }
+    if (!authOk(req)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
     }
-
-    logger.info('New SSE connection from:', req.ip);
     const transport = new SSEServerTransport('/messages', res);
     await mcpServer.connect(transport);
   });
 
-  // MCP message endpoint (for POST requests from SSE)
-  app.post('/messages', async (req, res) => {
-    // Optional API key authentication
-    if (apiKey) {
-      const providedKey = req.headers['authorization']?.replace('Bearer ', '');
-      if (providedKey !== apiKey) {
-        res.status(401).json({ error: 'Unauthorized' });
-        return;
-      }
-    }
-
-    // This is handled by the SSE transport
+  app.post('/messages', (_req, res) => {
     res.status(200).end();
   });
 
-  await new Promise<void>((resolve) => {
-    app.listen(httpPort, () => {
-      logger.startup(`✓ HTTP Server listening on port ${httpPort}`);
-      logger.info(`  - Health: http://localhost:${httpPort}/health`);
-      logger.info(`  - MCP SSE: http://localhost:${httpPort}/sse`);
-      if (apiKey) {
-        logger.info(`  - API Key authentication enabled`);
+  // MCP probe
+  app.get('/mcp', (_req, res) => {
+    res.json({ status: 'ok', endpoint: '/mcp' });
+  });
+
+  // Streamable HTTP MCP
+  app.post('/mcp', async (req: Request, res: Response) => {
+    if (!authOk(req)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const msg = req.body as Partial<JsonRpcRequest>;
+    const id: JsonRpcId = msg.id ?? null;
+
+    if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+      res.status(400).json(jsonRpcError(id, -32600, 'Invalid Request'));
+      return;
+    }
+
+    try {
+      if (msg.method === 'initialize') {
+        const result = {
+          protocolVersion: mcpProtocolVersion,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'zigbee2mqtt-mcp', version: '1.0.0' },
+        };
+        if (msg.id == null) res.status(204).end();
+        else res.json(jsonRpcResult(id, result));
+        return;
       }
-      resolve();
-    });
+
+
+      if (msg.method === 'notifications/initialized') {
+        res.status(204).end();
+        return;
+      }
+
+      if (msg.method === 'ping') {
+        if (msg.id == null) res.status(204).end();
+        else res.json(jsonRpcResult(id, { status: 'ok' }));
+        return;
+      }
+
+      if (msg.method === 'tools/list') {
+        const tools = (mcpServer as any).getToolDefinitions();
+        if (msg.id == null) res.status(204).end();
+        else res.json(jsonRpcResult(id, { tools }));
+        return;
+      }
+
+      if (msg.method === 'tools/call') {
+        const toolName = msg.params?.name;
+        const toolArgs = msg.params?.arguments ?? {};
+        const result = await (mcpServer as any).callToolByName(toolName, toolArgs);
+        if (msg.id == null) res.status(204).end();
+        else res.json(jsonRpcResult(id, result));
+        return;
+      }
+
+      res.status(404).json(jsonRpcError(id, -32601, 'Method not found'));
+    } catch (e: any) {
+      res.status(500).json(jsonRpcError(id, -32603, e?.message || 'Internal error'));
+    }
+  });
+
+  app.listen(httpPort, httpHost, () => {
+    logger.info(`✓ HTTP MCP listening on ${httpHost}:${httpPort}`);
   });
 }
 
+/* ================================
+ * Main
+ * ================================ */
+
 async function main() {
   logger.startup('=== ZigBee2MQTT MCP Server ===');
-  logger.debug(`Transport Mode: ${transportMode}`);
-  logger.debug(`Database: ${dbPath}`);
-  logger.debug(`MQTT Broker: ${config.brokerUrl}`);
-  logger.debug(`Base Topic: ${config.baseTopic}`);
 
-  // Initialize database
   const db = new ZigbeeDatabase(dbPath);
-  logger.debug('Database initialized');
-
-  // Initialize MQTT listener
   const mqtt = new MqttListener(config, db);
 
   try {
-    // Connect to MQTT broker
     await mqtt.connect();
-    logger.info('MQTT connected');
-
-    // Wait a moment for initial retained messages to be processed
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Show initial stats
-    const stats = db.getStats();
-    logger.startup(`✓ Ready: ${stats.deviceCount} devices, ${stats.fieldCount} fields, ${stats.capabilityCount} capabilities`);
-
-    // Start MCP server in selected mode
-    if (transportMode === 'http') {
-      await startHttpMode(db, mqtt);
-    } else {
-      await startStdioMode(db, mqtt);
-    }
-
-    // Keep the process running
-    process.on('SIGINT', async () => {
-      logger.info('Shutting down...');
-      await mqtt.disconnect();
-      db.close();
-      process.exit(0);
-    });
-
-    process.on('SIGTERM', async () => {
-      logger.info('Shutting down...');
-      await mqtt.disconnect();
-      db.close();
-      process.exit(0);
-    });
-  } catch (error) {
-    logger.error('Fatal error:', error);
-    await mqtt.disconnect();
-    db.close();
+    await new Promise((r) => setTimeout(r, 2000));
+    await startHttpServer(db, mqtt);
+  } catch (err) {
+    logger.error('Fatal error', err);
     process.exit(1);
   }
 }
 
-main().catch(error => {
-  logger.error('Unhandled error:', error);
-  process.exit(1);
-});
+main();
