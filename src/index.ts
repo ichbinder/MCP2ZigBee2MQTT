@@ -37,6 +37,10 @@ async function startHttpMode(db: ZigbeeDatabase, mqtt: MqttListener) {
 
   const mcpServer = new ZigbeeMcpServer(db, mqtt, config.baseTopic);
 
+  // Active SSE transports keyed by sessionId. We need to look up the
+  // right transport when POST /messages comes in for an existing session.
+  const transports = new Map<string, SSEServerTransport>();
+
   // Health check endpoint
   app.get('/health', (req, res) => {
     const stats = db.getStats();
@@ -60,6 +64,10 @@ async function startHttpMode(db: ZigbeeDatabase, mqtt: MqttListener) {
 
     logger.info('New SSE connection from:', req.ip);
     const transport = new SSEServerTransport('/messages', res);
+    transports.set(transport.sessionId, transport);
+    res.on('close', () => {
+      transports.delete(transport.sessionId);
+    });
     await mcpServer.connect(transport);
   });
 
@@ -74,8 +82,17 @@ async function startHttpMode(db: ZigbeeDatabase, mqtt: MqttListener) {
       }
     }
 
-    // This is handled by the SSE transport
-    res.status(200).end();
+    // Dispatch the POST body to the matching SSE transport. The third
+    // argument tells the SDK to use the already-parsed body instead of
+    // re-reading the request stream, which has already been consumed by
+    // express.json() above.
+    const sessionId = req.query.sessionId as string;
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      res.status(400).json({ error: 'No transport found for sessionId' });
+      return;
+    }
+    await transport.handlePostMessage(req, res, req.body);
   });
 
   await new Promise<void>((resolve) => {
