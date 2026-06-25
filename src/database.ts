@@ -75,6 +75,17 @@ export class ZigbeeDatabase {
   // Device operations
   upsertDevice(device: DatabaseDevice): void {
     const now = Date.now();
+
+    // friendly_name has a UNIQUE constraint, but ieee_address is the stable identity.
+    // When a device is renamed or re-paired, its friendly_name migrates to a different
+    // ieee_address. Z2M guarantees friendly_name is globally unique, so any existing row
+    // holding this name under a *different* ieee is stale — drop it first, otherwise the
+    // ieee-keyed upsert below hits the UNIQUE(friendly_name) constraint and the whole
+    // bridge/devices batch aborts mid-way.
+    this.db
+      .prepare(`DELETE FROM devices WHERE friendly_name = ? AND ieee_address != ?`)
+      .run(device.friendly_name, device.ieee_address);
+
     const stmt = this.db.prepare(`
       INSERT INTO devices (ieee_address, friendly_name, model, vendor, description, device_type, last_seen, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

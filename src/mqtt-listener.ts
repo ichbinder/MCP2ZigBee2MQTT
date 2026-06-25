@@ -149,8 +149,16 @@ export class MqttListener {
           return;
         }
 
-        // Process device with schema discovery
-        this.discovery.processDevice(device);
+        // Process each device in isolation: a single malformed/conflicting device must
+        // never abort the whole batch and leave the rest of the network undiscovered.
+        try {
+          this.discovery.processDevice(device);
+        } catch (error) {
+          logger.error(
+            `Skipping device ${device.friendly_name} (${device.ieee_address}):`,
+            error
+          );
+        }
       });
 
       const stats = this.db.getStats();
