@@ -22,6 +22,7 @@ export class SchemaDiscovery {
       vendor: device.definition?.vendor,
       description: device.definition?.description,
       device_type: device.type,
+      disabled: device.disabled ?? false,
       last_seen: Date.now(),
     };
 
