@@ -69,6 +69,34 @@ This MCP server connects to your MQTT broker and automatically analyzes all ZigB
    LOG_LEVEL=error
    ```
 
+   `MQTT_BROKER_URL` supports TCP (`mqtt://` and `mqtts://`) and MQTT over WebSockets (`ws://` and `wss://`). WebSocket connections require an MQTT-over-WebSocket listener on the broker; include its broker-specific path (often `/mqtt`) in the URL when required.
+
+   ```env
+   # Unencrypted MQTT over WebSocket
+   MQTT_BROKER_URL=ws://broker.example.com:9001/mqtt
+
+   # MQTT over secure WebSocket
+   MQTT_BROKER_URL=wss://broker.example.com/mqtt
+   ```
+
+   `MQTT_USERNAME`, `MQTT_PASSWORD`, and `MQTT_BASE_TOPIC` are used unchanged with every scheme.
+
+   For `wss://`, the current implementation keeps Node.js default TLS verification enabled (`rejectUnauthorized: true`): both the certificate chain and hostname are checked against the Node.js trust store. A certificate issued by a private CA is rejected until that CA is trusted.
+
+   To trust a private CA, extend the Node.js trust store before the process starts with [`NODE_EXTRA_CA_CERTS`](https://nodejs.org/docs/latest-v20.x/api/cli.html#node_extra_ca_certsfile), pointing to a PEM file. Node.js reads this variable only at process startup. With Docker, mount the PEM file and pass the variable to the container, for example:
+
+   ```yaml
+   # docker-compose.override.yml
+   services:
+     zigbee2mqtt-mcp:
+       environment:
+         NODE_EXTRA_CA_CERTS: /certs/mqtt-ca.pem
+       volumes:
+         - ./certs/mqtt-ca.pem:/certs/mqtt-ca.pem:ro
+   ```
+
+   The server does not currently expose per-connection `ca` or `rejectUnauthorized` settings. Do not use `NODE_TLS_REJECT_UNAUTHORIZED=0`; it disables TLS certificate verification for the whole Node.js process.
+
 4. **Start container**
    ```bash
    docker compose up -d
@@ -364,9 +392,12 @@ docker compose up -d
 
 ### MQTT connection fails
 
-1. Check MQTT broker URL in `.env`
-2. If broker runs on host, use `mqtt://host.docker.internal:1883`
-3. Check firewall settings
+1. Check the broker URL, protocol, and port in `.env`
+2. If the broker runs on the host, use `mqtt://host.docker.internal:1883`
+3. For `ws://` or `wss://`, verify that the broker exposes an MQTT-over-WebSocket listener and that the URL includes its required path
+4. For `wss://`, remember that Node.js verifies both the certificate chain and hostname by default
+5. For a private CA, mount its PEM file, set `NODE_EXTRA_CA_CERTS` before Node.js starts, and restart the process or container
+6. Check firewall rules and MQTT credentials
 
 ### No devices found
 
