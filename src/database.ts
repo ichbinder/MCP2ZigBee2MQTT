@@ -1,6 +1,8 @@
 import Database from 'better-sqlite3';
 import { DatabaseDevice, DeviceField, DeviceCapability, DeviceState } from './types.js';
 
+type DatabaseDeviceRow = Omit<DatabaseDevice, 'disabled'> & { disabled: number };
+
 export class ZigbeeDatabase {
   private db: Database.Database;
 
@@ -19,12 +21,18 @@ export class ZigbeeDatabase {
         vendor TEXT,
         description TEXT,
         device_type TEXT,
+        disabled INTEGER NOT NULL DEFAULT 0,
         last_seen INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_devices_friendly_name ON devices(friendly_name);
     `);
+
+    const deviceColumns = this.db.prepare('PRAGMA table_info(devices)').all() as Array<{ name: string }>;
+    if (!deviceColumns.some(({ name }) => name === 'disabled')) {
+      this.db.exec('ALTER TABLE devices ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0');
+    }
 
     // Device fields - schema/structure of each device's data
     this.db.exec(`
@@ -76,14 +84,15 @@ export class ZigbeeDatabase {
   upsertDevice(device: DatabaseDevice): void {
     const now = Date.now();
     const stmt = this.db.prepare(`
-      INSERT INTO devices (ieee_address, friendly_name, model, vendor, description, device_type, last_seen, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO devices (ieee_address, friendly_name, model, vendor, description, device_type, disabled, last_seen, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(ieee_address) DO UPDATE SET
         friendly_name = excluded.friendly_name,
         model = excluded.model,
         vendor = excluded.vendor,
         description = excluded.description,
         device_type = excluded.device_type,
+        disabled = excluded.disabled,
         last_seen = excluded.last_seen,
         updated_at = excluded.updated_at
     `);
@@ -95,22 +104,31 @@ export class ZigbeeDatabase {
       device.vendor || null,
       device.description || null,
       device.device_type || null,
+      device.disabled ? 1 : 0,
       device.last_seen || now,
       now,
       now
     );
   }
 
+  private mapDeviceRow(row: DatabaseDeviceRow): DatabaseDevice {
+    return {
+      ...row,
+      disabled: Boolean(row.disabled),
+    };
+  }
+
   getDevice(identifier: string): DatabaseDevice | null {
     const stmt = this.db.prepare(`
       SELECT * FROM devices WHERE ieee_address = ? OR friendly_name = ?
     `);
-    return stmt.get(identifier, identifier) as DatabaseDevice | null;
+    const row = stmt.get(identifier, identifier) as DatabaseDeviceRow | undefined;
+    return row ? this.mapDeviceRow(row) : null;
   }
 
   getAllDevices(): DatabaseDevice[] {
     const stmt = this.db.prepare('SELECT * FROM devices ORDER BY friendly_name');
-    return stmt.all() as DatabaseDevice[];
+    return (stmt.all() as DatabaseDeviceRow[]).map(row => this.mapDeviceRow(row));
   }
 
   searchDevices(query: string): DatabaseDevice[] {
@@ -120,7 +138,8 @@ export class ZigbeeDatabase {
       ORDER BY friendly_name
     `);
     const searchPattern = `%${query}%`;
-    return stmt.all(searchPattern, searchPattern, searchPattern) as DatabaseDevice[];
+    return (stmt.all(searchPattern, searchPattern, searchPattern) as DatabaseDeviceRow[])
+      .map(row => this.mapDeviceRow(row));
   }
 
   // Field operations
@@ -190,7 +209,7 @@ export class ZigbeeDatabase {
       WHERE dc.capability_type = ?
       ORDER BY d.friendly_name
     `);
-    return stmt.all(capabilityType) as DatabaseDevice[];
+    return (stmt.all(capabilityType) as DatabaseDeviceRow[]).map(row => this.mapDeviceRow(row));
   }
 
   // State operations
@@ -232,7 +251,7 @@ export class ZigbeeDatabase {
       WHERE created_at >= ?
       ORDER BY created_at DESC
     `);
-    return stmt.all(cutoffTime) as DatabaseDevice[];
+    return (stmt.all(cutoffTime) as DatabaseDeviceRow[]).map(row => this.mapDeviceRow(row));
   }
 
   // Utility

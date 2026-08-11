@@ -6,6 +6,7 @@ export interface DatabaseDevice {
   vendor?: string;
   description?: string;
   device_type?: string;
+  disabled: boolean;
   last_seen?: number;
   created_at?: number;
   updated_at?: number;
@@ -80,6 +81,7 @@ export interface DeviceInfo {
   vendor?: string;
   description?: string;
   device_type?: string;
+  disabled: boolean;
   fields: DeviceFieldInfo[];
   capabilities: string[];
   current_state?: Record<string, any>;

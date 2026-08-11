@@ -232,6 +232,7 @@ export class ZigbeeMcpServer {
       model: d.model || 'Unknown',
       vendor: d.vendor || 'Unknown',
       type: d.device_type || 'Unknown',
+      disabled: d.disabled,
       created_at: d.created_at,
       last_seen: d.last_seen,
       updated_at: d.updated_at,
@@ -266,6 +267,7 @@ export class ZigbeeMcpServer {
       vendor: dbDevice.vendor,
       description: dbDevice.description,
       device_type: dbDevice.device_type,
+      disabled: dbDevice.disabled,
       fields: fields.map(f => ({
         name: f.field_name,
         type: f.field_type,
