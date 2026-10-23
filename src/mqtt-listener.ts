@@ -116,7 +116,7 @@ export class MqttListener {
 
       // Handle bridge/groups
       if (topic === `${baseTopic}/bridge/groups`) {
-        logger.debug('Bridge groups received');
+        this.handleBridgeGroups(message);
         return;
       }
 
@@ -143,6 +143,14 @@ export class MqttListener {
       const devices: Z2MDevice[] = JSON.parse(message);
       logger.info(`Discovered ${devices.length} devices`);
 
+      // bridge/devices is the full set: drop devices Z2M no longer knows about
+      const removed = this.db.pruneDevicesNotIn(
+        devices.filter(d => d.type !== 'Coordinator').map(d => d.ieee_address)
+      );
+      if (removed > 0) {
+        logger.info(`Removed ${removed} devices no longer in Zigbee2MQTT`);
+      }
+
       devices.forEach(device => {
         // Skip coordinator
         if (device.type === 'Coordinator') {
@@ -157,6 +165,16 @@ export class MqttListener {
       logger.debug(`Database: ${stats.deviceCount} devices, ${stats.fieldCount} fields, ${stats.capabilityCount} capabilities`);
     } catch (error) {
       logger.error('Error processing bridge/devices:', error);
+    }
+  }
+
+  private handleBridgeGroups(message: string): void {
+    try {
+      const groups = JSON.parse(message);
+      this.db.replaceGroups(groups);
+      logger.info(`Discovered ${groups.length} groups`);
+    } catch (error) {
+      logger.error('Error processing bridge/groups:', error);
     }
   }
 

@@ -26,6 +26,17 @@ export class ZigbeeDatabase {
       CREATE INDEX IF NOT EXISTS idx_devices_friendly_name ON devices(friendly_name);
     `);
 
+    // Groups - Z2M groups from bridge/groups (replaced wholesale on every message)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS groups (
+        id INTEGER PRIMARY KEY,
+        friendly_name TEXT NOT NULL,
+        members_json TEXT NOT NULL,
+        scenes_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+
     // Device fields - schema/structure of each device's data
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS device_fields (
@@ -84,7 +95,7 @@ export class ZigbeeDatabase {
         vendor = excluded.vendor,
         description = excluded.description,
         device_type = excluded.device_type,
-        last_seen = excluded.last_seen,
+        last_seen = COALESCE(excluded.last_seen, devices.last_seen),
         updated_at = excluded.updated_at
     `);
 
@@ -95,10 +106,48 @@ export class ZigbeeDatabase {
       device.vendor || null,
       device.description || null,
       device.device_type || null,
-      device.last_seen || now,
+      device.last_seen ?? null,
       now,
       now
     );
+  }
+
+  // Remove every device not in `keep` (cascades to fields, capabilities, state).
+  // Returns the number of removed devices.
+  pruneDevicesNotIn(keep: string[]): number {
+    const run = this.db.transaction((ieees: string[]) => {
+      this.db.exec('CREATE TEMP TABLE IF NOT EXISTS keep_ieee (ieee_address TEXT PRIMARY KEY)');
+      this.db.exec('DELETE FROM keep_ieee');
+      const ins = this.db.prepare('INSERT OR IGNORE INTO keep_ieee VALUES (?)');
+      ieees.forEach(i => ins.run(i));
+      return this.db.prepare(
+        'DELETE FROM devices WHERE ieee_address NOT IN (SELECT ieee_address FROM keep_ieee)'
+      ).run().changes;
+    });
+    return run(keep);
+  }
+
+  replaceGroups(groups: { id: number; friendly_name: string; members?: unknown[]; scenes?: unknown[] }[]): void {
+    const now = Date.now();
+    const run = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM groups').run();
+      const ins = this.db.prepare(
+        'INSERT INTO groups (id, friendly_name, members_json, scenes_json, updated_at) VALUES (?, ?, ?, ?, ?)'
+      );
+      groups.forEach(g => ins.run(g.id, g.friendly_name, JSON.stringify(g.members ?? []), JSON.stringify(g.scenes ?? []), now));
+    });
+    run();
+  }
+
+  getAllGroups(): { id: number; friendly_name: string; members: unknown[]; scenes: unknown[]; updated_at: number }[] {
+    const rows = this.db.prepare('SELECT * FROM groups ORDER BY friendly_name').all() as any[];
+    return rows.map(r => ({
+      id: r.id,
+      friendly_name: r.friendly_name,
+      members: JSON.parse(r.members_json),
+      scenes: JSON.parse(r.scenes_json),
+      updated_at: r.updated_at,
+    }));
   }
 
   getDevice(identifier: string): DatabaseDevice | null {

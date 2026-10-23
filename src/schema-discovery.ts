@@ -22,7 +22,6 @@ export class SchemaDiscovery {
       vendor: device.definition?.vendor,
       description: device.definition?.description,
       device_type: device.type,
-      last_seen: Date.now(),
     };
 
     this.db.upsertDevice(dbDevice);

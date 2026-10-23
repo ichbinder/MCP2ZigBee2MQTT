@@ -53,6 +53,8 @@ export class ZigbeeMcpServer {
         switch (name) {
           case 'list_devices':
             return await this.handleListDevices(args);
+          case 'list_groups':
+            return await this.handleListGroups();
           case 'get_device_info':
             return await this.handleGetDeviceInfo(args);
           case 'find_devices':
@@ -92,6 +94,14 @@ export class ZigbeeMcpServer {
       {
         name: 'list_devices',
         description: 'List all ZigBee devices with basic information',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'list_groups',
+        description: 'List all Zigbee2MQTT groups with their members and scenes',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -242,6 +252,17 @@ export class ZigbeeMcpServer {
         {
           type: 'text' as const,
           text: JSON.stringify(deviceList, null, 2),
+        },
+      ],
+    };
+  }
+
+  private async handleListGroups() {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(this.db.getAllGroups(), null, 2),
         },
       ],
     };
